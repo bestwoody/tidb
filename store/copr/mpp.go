@@ -16,6 +16,7 @@ package copr
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strconv"
 	"sync"
@@ -149,31 +150,125 @@ type mppIterator struct {
 	enableCollectExecutionInfo bool
 }
 
+type BatchDispatchReqKey struct {
+	addr   string
+	is_cop bool
+}
+
+type BatchDispatchElemEnv struct {
+	task    *kv.MPPDispatchRequest
+	localCh chan *tikvrpc.ResponseFromLocalChannel
+	mppReq  *mpp.DispatchTaskRequest
+}
+
 func (m *mppIterator) run(ctx context.Context) {
+	batchReqMap := make(map[BatchDispatchReqKey][]*BatchDispatchElemEnv)
+	batchReqKeyOrderedList := make([]BatchDispatchReqKey, 0)
+	//copNodesMap := make(map[BatchDispatchReqKey][]*kv.MPPDispatchRequest)
+	//tasksList := make([]*kv.MPPDispatchRequest, 0)
+
 	for _, task := range m.tasks {
-		if atomic.LoadUint32(&m.closed) == 1 {
-			break
+		addr := task.Meta.GetAddress()
+		originalTask, ok := task.Meta.(*batchCopTask)
+		if ok && originalTask != nil {
+			addr = originalTask.ctx.Addr
 		}
-		m.mu.Lock()
-		if task.State == kv.MppTaskReady {
-			task.State = kv.MppTaskRunning
+		batchReqKey := BatchDispatchReqKey{addr, ok}
+
+		list, entryOk := batchReqMap[batchReqKey]
+		var localCh chan *tikvrpc.ResponseFromLocalChannel
+		if !entryOk || list == nil {
+			batchReqMap[batchReqKey] = make([]*BatchDispatchElemEnv, 0)
+			localCh = nil
+			batchReqKeyOrderedList = append(batchReqKeyOrderedList, batchReqKey)
+		} else {
+			localCh = make(chan *tikvrpc.ResponseFromLocalChannel, 1)
 		}
-		m.mu.Unlock()
-		m.wg.Add(1)
-		boMaxSleep := copNextMaxBackoff
-		failpoint.Inject("ReduceCopNextMaxBackoff", func(value failpoint.Value) {
-			if value.(bool) {
-				boMaxSleep = 2
-			}
-		})
-		bo := backoff.NewBackoffer(ctx, boMaxSleep)
-		go func(mppTask *kv.MPPDispatchRequest) {
-			defer func() {
-				m.wg.Done()
-			}()
-			m.handleDispatchReq(ctx, bo, mppTask)
-		}(task)
+		curElemEnv := &BatchDispatchElemEnv{task, localCh, m.prepareDispatchReq(task)}
+		batchReqMap[batchReqKey] = append(batchReqMap[batchReqKey], curElemEnv)
+		if localCh != nil {
+			m.updateDispatchReqBatch(batchReqMap[batchReqKey][0].mppReq, curElemEnv.mppReq)
+		}
 	}
+
+	for _, batchReqKey := range batchReqKeyOrderedList {
+		list, entryOk := batchReqMap[batchReqKey]
+		if entryOk && list != nil {
+			for _, elemEnv := range list {
+				task := elemEnv.task
+				if atomic.LoadUint32(&m.closed) == 1 {
+					break
+				}
+				m.mu.Lock()
+				if task.State == kv.MppTaskReady {
+					task.State = kv.MppTaskRunning
+				}
+				m.mu.Unlock()
+				m.wg.Add(1)
+				boMaxSleep := copNextMaxBackoff
+				failpoint.Inject("ReduceCopNextMaxBackoff", func(value failpoint.Value) {
+					if value.(bool) {
+						boMaxSleep = 2
+					}
+				})
+				bo := backoff.NewBackoffer(ctx, boMaxSleep)
+				go func(elemEnv *BatchDispatchElemEnv) {
+					defer func() {
+						m.wg.Done()
+					}()
+					//tasksList := make([]*kv.MPPDispatchRequest, 0)
+					//tasksList = append(tasksList, mppTask)
+					//m.handleDispatchBatchReq(ctx, bo, tasksList, mppTask.Meta.GetAddress(), mppTask.StartTs)
+					m.handleDispatchReq4Batch(ctx, bo, elemEnv, list)
+				}(elemEnv)
+			}
+		}
+	}
+
+	//for _, task := range m.tasks {
+	//	if atomic.LoadUint32(&m.closed) == 1 {
+	//		break
+	//	}
+	//	m.mu.Lock()
+	//	if task.State == kv.MppTaskReady {
+	//		task.State = kv.MppTaskRunning
+	//	}
+	//	m.mu.Unlock()
+	//	m.wg.Add(1)
+	//	boMaxSleep := copNextMaxBackoff
+	//	failpoint.Inject("ReduceCopNextMaxBackoff", func(value failpoint.Value) {
+	//		if value.(bool) {
+	//			boMaxSleep = 2
+	//		}
+	//	})
+	//	bo := backoff.NewBackoffer(ctx, boMaxSleep)
+	//	addr := task.Meta.GetAddress()
+	//	originalTask, ok := task.Meta.(*batchCopTask)
+	//	if ok && originalTask != nil {
+	//		addr = originalTask.ctx.Addr
+	//	}
+	//	batchReqKey := BatchDispatchReqKey{addr, ok}
+	//
+	//	list, entryOk := batchReqMap[batchReqKey]
+	//	var localCh chan *tikvrpc.ResponseFromLocalChannel
+	//	if !entryOk || list == nil {
+	//		batchReqMap[batchReqKey] = make([]*BatchDispatchElemEnv, 0)
+	//		localCh = nil
+	//	} else {
+	//		localCh = make(chan *tikvrpc.ResponseFromLocalChannel, 1)
+	//	}
+	//	curElemEnv := &BatchDispatchElemEnv{task, localCh}
+	//	batchReqMap[batchReqKey] = append(batchReqMap[batchReqKey], curElemEnv)
+	//	go func(mppTask *BatchDispatchElemEnv) {
+	//		defer func() {
+	//			m.wg.Done()
+	//		}()
+	//		//tasksList := make([]*kv.MPPDispatchRequest, 0)
+	//		//tasksList = append(tasksList, mppTask)
+	//		//m.handleDispatchBatchReq(ctx, bo, tasksList, mppTask.Meta.GetAddress(), mppTask.StartTs)
+	//		m.handleDispatchReq(ctx, bo, mppTask)
+	//	}(task)
+	//}
 	m.wg.Wait()
 	close(m.respChan)
 }
@@ -190,6 +285,187 @@ func (m *mppIterator) sendToRespCh(resp *mppResponse) (exit bool) {
 		exit = true
 	}
 	return
+}
+
+func (m *mppIterator) updateDispatchReqBatch(mppReqBatch *mpp.DispatchTaskRequest, curMppReq *mpp.DispatchTaskRequest) {
+	if mppReqBatch.OtherReqs == nil {
+		mppReqBatch.OtherReqs = make([]*mpp.DispatchTaskRequest, 0)
+	}
+	mppReqBatch.OtherReqs = append(mppReqBatch.OtherReqs, curMppReq)
+}
+
+func (m *mppIterator) prepareDispatchReq(req *kv.MPPDispatchRequest) *mpp.DispatchTaskRequest {
+	var regionInfos []*coprocessor.RegionInfo
+	originalTask, ok := req.Meta.(*batchCopTask)
+	if ok {
+		for _, ri := range originalTask.regionInfos {
+			regionInfos = append(regionInfos, &coprocessor.RegionInfo{
+				RegionId: ri.Region.GetID(),
+				RegionEpoch: &metapb.RegionEpoch{
+					ConfVer: ri.Region.GetConfVer(),
+					Version: ri.Region.GetVer(),
+				},
+				Ranges: ri.Ranges.ToPBRanges(),
+			})
+		}
+	}
+
+	// meta for current task.
+	taskMeta := &mpp.TaskMeta{StartTs: req.StartTs, TaskId: req.ID, Address: req.Meta.GetAddress()}
+
+	mppReq := &mpp.DispatchTaskRequest{
+		Meta:        taskMeta,
+		EncodedPlan: req.Data,
+		// TODO: This is only an experience value. It's better to be configurable.
+		Timeout:   60,
+		SchemaVer: req.SchemaVar,
+		Regions:   regionInfos,
+	}
+	return mppReq
+	//wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPTask, mppReq, kvrpcpb.Context{})
+	//wrappedReq.StoreTp = tikvrpc.TiFlash
+}
+
+// TODO:: Consider that which way is better:
+// - dispatch all tasks at once, and connect tasks at second.
+// - dispatch tasks and establish connection at the same time.
+func (m *mppIterator) handleDispatchReq4Batch(ctx context.Context, bo *Backoffer, elemEnv *BatchDispatchElemEnv, envs []*BatchDispatchElemEnv) {
+	//var regionInfos []*coprocessor.RegionInfo
+	originalTask, _ := elemEnv.task.Meta.(*batchCopTask)
+	//if ok {
+	//	for _, ri := range originalTask.regionInfos {
+	//		regionInfos = append(regionInfos, &coprocessor.RegionInfo{
+	//			RegionId: ri.Region.GetID(),
+	//			RegionEpoch: &metapb.RegionEpoch{
+	//				ConfVer: ri.Region.GetConfVer(),
+	//				Version: ri.Region.GetVer(),
+	//			},
+	//			Ranges: ri.Ranges.ToPBRanges(),
+	//		})
+	//	}
+	//}
+
+	req := elemEnv.task
+
+	// meta for current task.
+	taskMeta := &mpp.TaskMeta{StartTs: req.StartTs, TaskId: req.ID, Address: req.Meta.GetAddress()}
+	//mppReq := &mpp.DispatchTaskRequest{
+	//	Meta:        taskMeta,
+	//	EncodedPlan: req.Data,
+	//	// TODO: This is only an experience value. It's better to be configurable.
+	//	Timeout:   60,
+	//	SchemaVer: req.SchemaVar,
+	//	Regions:   regionInfos,
+	//}
+
+	wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPTask, elemEnv.mppReq, kvrpcpb.Context{})
+	wrappedReq.StoreTp = tikvrpc.TiFlash
+	if elemEnv.localCh != nil {
+		wrappedReq.ResponseViaLocalChannel = true
+		wrappedReq.LocalCh = elemEnv.localCh
+	}
+
+	// TODO: Handle dispatch task response correctly, including retry logic and cancel logic.
+	var rpcResp *tikvrpc.Response
+	var err error
+	var retry bool
+	var originalErr error
+	// If copTasks is not empty, we should send request according to region distribution.
+	// Or else it's the task without region, which always happens in high layer task without table.
+	// In that case
+	if originalTask != nil {
+		sender := NewRegionBatchRequestSender(m.store.GetRegionCache(), m.store.GetTiKVClient(), m.enableCollectExecutionInfo)
+		fmt.Printf("\nCopBatch %v .\n", originalTask.ctx.String())
+		rpcResp, retry, _, err = sender.SendReqToAddr(bo, originalTask.ctx, originalTask.regionInfos, wrappedReq, tikv.ReadTimeoutMedium)
+		// No matter what the rpc error is, we won't retry the mpp dispatch tasks.
+		// TODO: If we want to retry, we must redo the plan fragment cutting and task scheduling.
+		// That's a hard job but we can try it in the future.
+		if sender.GetRPCError() != nil {
+			originalErr = sender.GetRPCError()
+			logutil.BgLogger().Warn("mpp dispatch meet io error", zap.String("error", sender.GetRPCError().Error()), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+			// if needTriggerFallback is true, we return timeout to trigger tikv's fallback
+			if m.needTriggerFallback {
+				err = derr.ErrTiFlashServerTimeout
+			} else {
+				err = sender.GetRPCError()
+			}
+		}
+	} else {
+		fmt.Printf("\nDispatchMpp %v .\n", req.Meta.GetAddress())
+		rpcResp, err = m.store.GetTiKVClient().SendRequest(ctx, req.Meta.GetAddress(), wrappedReq, tikv.ReadTimeoutMedium)
+		originalErr = err
+		if errors.Cause(err) == context.Canceled || status.Code(errors.Cause(err)) == codes.Canceled {
+			retry = false
+		} else if err != nil {
+			if bo.Backoff(tikv.BoTiFlashRPC(), err) == nil {
+				retry = true
+			}
+		}
+	}
+
+	if retry && elemEnv.localCh == nil {
+		logutil.BgLogger().Warn("mpp dispatch meet error and retrying", zap.Error(err), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+		m.handleDispatchReq4Batch(ctx, bo, elemEnv, envs)
+		return
+	}
+
+	if err != nil {
+		if elemEnv.localCh == nil {
+			for _, env := range envs {
+				if env.localCh != nil {
+					//TODO be compactible with tiflash in old version
+					env.localCh <- &tikvrpc.ResponseFromLocalChannel{Err: originalErr}
+				}
+			}
+		}
+
+		logutil.BgLogger().Error("mpp dispatch meet error", zap.String("error", err.Error()), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+		// if needTriggerFallback is true, we return timeout to trigger tikv's fallback
+		if m.needTriggerFallback {
+			err = derr.ErrTiFlashServerTimeout
+		}
+		m.sendError(err)
+		return
+	}
+
+	realResp := rpcResp.Resp.(*mpp.DispatchTaskResponse)
+
+	if elemEnv.localCh == nil {
+		for i, env := range envs {
+			if env.localCh != nil {
+				//TODO be compactible with tiflash in old version
+				env.localCh <- &tikvrpc.ResponseFromLocalChannel{Resp: &tikvrpc.Response{Resp: realResp.OtherResps[i-1]}}
+			}
+		}
+	}
+
+	if realResp.Error != nil {
+		logutil.BgLogger().Error("mpp dispatch response meet error", zap.String("error", realResp.Error.Msg), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+		m.sendError(errors.New(realResp.Error.Msg))
+		return
+	}
+	if len(realResp.RetryRegions) > 0 {
+		logutil.BgLogger().Info("TiFlash found " + strconv.Itoa(len(realResp.RetryRegions)) + " stale regions. Only first " + strconv.Itoa(mathutil.Min(10, len(realResp.RetryRegions))) + " regions will be logged if the log level is higher than Debug")
+		for index, retry := range realResp.RetryRegions {
+			id := tikv.NewRegionVerID(retry.Id, retry.RegionEpoch.ConfVer, retry.RegionEpoch.Version)
+			if index < 10 || log.GetLevel() <= zap.DebugLevel {
+				logutil.BgLogger().Info("invalid region because tiflash detected stale region", zap.String("region id", id.String()))
+			}
+			m.store.GetRegionCache().InvalidateCachedRegionWithReason(id, tikv.EpochNotMatch)
+		}
+	}
+	failpoint.Inject("mppNonRootTaskError", func(val failpoint.Value) {
+		if val.(bool) && !req.IsRoot {
+			time.Sleep(1 * time.Second)
+			m.sendError(derr.ErrTiFlashServerTimeout)
+			return
+		}
+	})
+	if !req.IsRoot {
+		return
+	}
+
+	m.establishMPPConns(bo, req, taskMeta)
 }
 
 // TODO:: Consider that which way is better:
@@ -235,6 +511,7 @@ func (m *mppIterator) handleDispatchReq(ctx context.Context, bo *Backoffer, req 
 	// In that case
 	if originalTask != nil {
 		sender := NewRegionBatchRequestSender(m.store.GetRegionCache(), m.store.GetTiKVClient(), m.enableCollectExecutionInfo)
+		fmt.Printf("\nCopBatch %v .\n", originalTask.ctx.String())
 		rpcResp, retry, _, err = sender.SendReqToAddr(bo, originalTask.ctx, originalTask.regionInfos, wrappedReq, tikv.ReadTimeoutMedium)
 		// No matter what the rpc error is, we won't retry the mpp dispatch tasks.
 		// TODO: If we want to retry, we must redo the plan fragment cutting and task scheduling.
@@ -249,6 +526,7 @@ func (m *mppIterator) handleDispatchReq(ctx context.Context, bo *Backoffer, req 
 			}
 		}
 	} else {
+		fmt.Printf("\nDispatchMpp %v .\n", req.Meta.GetAddress())
 		rpcResp, err = m.store.GetTiKVClient().SendRequest(ctx, req.Meta.GetAddress(), wrappedReq, tikv.ReadTimeoutMedium)
 		if errors.Cause(err) == context.Canceled || status.Code(errors.Cause(err)) == codes.Canceled {
 			retry = false
@@ -305,6 +583,257 @@ func (m *mppIterator) handleDispatchReq(ctx context.Context, bo *Backoffer, req 
 
 	m.establishMPPConns(bo, req, taskMeta)
 }
+
+//func (m *mppIterator) handleDispatchReqBatch(ctx context.Context, bo *Backoffer, reqs []*kv.MPPDispatchRequest, addr string, isCop bool, startTS uint64) {
+//	var mppReq *mpp.DispatchTaskRequest
+//
+//	for _, req := range reqs {
+//		var regionInfos []*coprocessor.RegionInfo
+//		originalTask, ok := req.Meta.(*batchCopTask)
+//		if ok {
+//			for _, ri := range originalTask.regionInfos {
+//				regionInfos = append(regionInfos, &coprocessor.RegionInfo{
+//					RegionId: ri.Region.GetID(),
+//					RegionEpoch: &metapb.RegionEpoch{
+//						ConfVer: ri.Region.GetConfVer(),
+//						Version: ri.Region.GetVer(),
+//					},
+//					Ranges: ri.Ranges.ToPBRanges(),
+//				})
+//			}
+//		}
+//
+//		// meta for current task.
+//		taskMeta := &mpp.TaskMeta{StartTs: req.StartTs, TaskId: req.ID, Address: req.Meta.GetAddress()}
+//		curMppReq := &mpp.DispatchTaskRequest{
+//			Meta:        taskMeta,
+//			EncodedPlan: req.Data,
+//			// TODO: This is only an experience value. It's better to be configurable.
+//			Timeout:   60,
+//			SchemaVer: req.SchemaVar,
+//			Regions:   regionInfos,
+//		}
+//		if mppReq == nil {
+//			mppReq = curMppReq
+//			curMppReq.OtherReqs = make([]*mpp.DispatchTaskRequest, 0)
+//		} else {
+//			mppReq.OtherReqs = append(mppReq.OtherReqs, mppReq)
+//		}
+//	}
+//	if mppReq == nil {
+//		return
+//	}
+//
+//	wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPTask, mppReq, kvrpcpb.Context{})
+//	wrappedReq.StoreTp = tikvrpc.TiFlash
+//
+//	// TODO: Handle dispatch task response correctly, including retry logic and cancel logic.
+//	var rpcResp *tikvrpc.Response
+//	var err error
+//	var retry bool
+//	// If copTasks is not empty, we should send request according to region distribution.
+//	// Or else it's the task without region, which always happens in high layer task without table.
+//	// In that case
+//	if originalTask != nil {
+//		sender := NewRegionBatchRequestSender(m.store.GetRegionCache(), m.store.GetTiKVClient(), m.enableCollectExecutionInfo)
+//		rpcResp, retry, _, err = sender.SendReqToAddr(bo, originalTask.ctx, originalTask.regionInfos, wrappedReq, tikv.ReadTimeoutMedium)
+//		// No matter what the rpc error is, we won't retry the mpp dispatch tasks.
+//		// TODO: If we want to retry, we must redo the plan fragment cutting and task scheduling.
+//		// That's a hard job but we can try it in the future.
+//		if sender.GetRPCError() != nil {
+//			logutil.BgLogger().Warn("mpp dispatch meet io error", zap.String("error", sender.GetRPCError().Error()), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+//			// if needTriggerFallback is true, we return timeout to trigger tikv's fallback
+//			if m.needTriggerFallback {
+//				err = derr.ErrTiFlashServerTimeout
+//			} else {
+//				err = sender.GetRPCError()
+//			}
+//		}
+//	} else {
+//		rpcResp, err = m.store.GetTiKVClient().SendRequest(ctx, req.Meta.GetAddress(), wrappedReq, tikv.ReadTimeoutMedium)
+//		if errors.Cause(err) == context.Canceled || status.Code(errors.Cause(err)) == codes.Canceled {
+//			retry = false
+//		} else if err != nil {
+//			if bo.Backoff(tikv.BoTiFlashRPC(), err) == nil {
+//				retry = true
+//			}
+//		}
+//	}
+//
+//	if retry {
+//		logutil.BgLogger().Warn("mpp dispatch meet error and retrying", zap.Error(err), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+//		m.handleDispatchReq(ctx, bo, req)
+//		return
+//	}
+//
+//	if err != nil {
+//		logutil.BgLogger().Error("mpp dispatch meet error", zap.String("error", err.Error()), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+//		// if needTriggerFallback is true, we return timeout to trigger tikv's fallback
+//		if m.needTriggerFallback {
+//			err = derr.ErrTiFlashServerTimeout
+//		}
+//		m.sendError(err)
+//		return
+//	}
+//
+//	realResp := rpcResp.Resp.(*mpp.DispatchTaskResponse)
+//
+//	if realResp.Error != nil {
+//		logutil.BgLogger().Error("mpp dispatch response meet error", zap.String("error", realResp.Error.Msg), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+//		m.sendError(errors.New(realResp.Error.Msg))
+//		return
+//	}
+//	if len(realResp.RetryRegions) > 0 {
+//		logutil.BgLogger().Info("TiFlash found " + strconv.Itoa(len(realResp.RetryRegions)) + " stale regions. Only first " + strconv.Itoa(mathutil.Min(10, len(realResp.RetryRegions))) + " regions will be logged if the log level is higher than Debug")
+//		for index, retry := range realResp.RetryRegions {
+//			id := tikv.NewRegionVerID(retry.Id, retry.RegionEpoch.ConfVer, retry.RegionEpoch.Version)
+//			if index < 10 || log.GetLevel() <= zap.DebugLevel {
+//				logutil.BgLogger().Info("invalid region because tiflash detected stale region", zap.String("region id", id.String()))
+//			}
+//			m.store.GetRegionCache().InvalidateCachedRegionWithReason(id, tikv.EpochNotMatch)
+//		}
+//	}
+//	failpoint.Inject("mppNonRootTaskError", func(val failpoint.Value) {
+//		if val.(bool) && !req.IsRoot {
+//			time.Sleep(1 * time.Second)
+//			m.sendError(derr.ErrTiFlashServerTimeout)
+//			return
+//		}
+//	})
+//	if !req.IsRoot {
+//		return
+//	}
+//
+//	m.establishMPPConns(bo, req, taskMeta)
+//}
+
+// TODO:: Consider that which way is better:
+// - dispatch all tasks at once, and connect tasks at second.
+// - dispatch tasks and establish connection at the same time.
+//func (m *mppIterator) handleDispatchBatchReq(ctx context.Context, bo *Backoffer, reqs []*kv.MPPDispatchRequest, addr string, startTS uint64) {
+//
+//	tasks := make([]*mpp.DispatchTaskRequest, 0)
+//	for _, req := range reqs {
+//		var regionInfos []*coprocessor.RegionInfo
+//		originalTask, ok := req.Meta.(*batchCopTask)
+//		if ok {
+//			for _, ri := range originalTask.regionInfos {
+//				regionInfos = append(regionInfos, &coprocessor.RegionInfo{
+//					RegionId: ri.Region.GetID(),
+//					RegionEpoch: &metapb.RegionEpoch{
+//						ConfVer: ri.Region.GetConfVer(),
+//						Version: ri.Region.GetVer(),
+//					},
+//					Ranges: ri.Ranges.ToPBRanges(),
+//				})
+//			}
+//		}
+//		// meta for current task.
+//		taskMeta := &mpp.TaskMeta{StartTs: req.StartTs, TaskId: req.ID, Address: req.Meta.GetAddress()}
+//
+//		mppSubReq := &mpp.DispatchTaskRequest{
+//			Meta:        taskMeta,
+//			EncodedPlan: req.Data,
+//			// TODO: This is only an experience value. It's better to be configurable.
+//			Timeout:   60,
+//			SchemaVer: req.SchemaVar,
+//			Regions:   regionInfos,
+//		}
+//
+//		tasks = append(tasks, mppSubReq)
+//
+//	}
+//
+//	mppReq := &mpp.DispatchTasksRequest{
+//		Tasks: tasks,
+//	}
+//
+//	wrappedReq := tikvrpc.NewRequest(tikvrpc.CmdMPPTask, mppReq, kvrpcpb.Context{})
+//	wrappedReq.StoreTp = tikvrpc.TiFlash
+//
+//	// TODO: Handle dispatch task response correctly, including retry logic and cancel logic.
+//	var rpcResps *tikvrpc.Response
+//	var err error
+//	var retry bool
+//	// If copTasks is not empty, we should send request according to region distribution.
+//	// Or else it's the task without region, which always happens in high layer task without table.
+//	// In that case
+//	//if originalTask != nil {
+//	//	sender := NewRegionBatchRequestSender(m.store.GetRegionCache(), m.store.GetTiKVClient(), m.enableCollectExecutionInfo)
+//	//	rpcResp, retry, _, err = sender.SendReqToAddr(bo, originalTask.ctx, originalTask.regionInfos, wrappedReq, tikv.ReadTimeoutMedium)
+//	//	// No matter what the rpc error is, we won't retry the mpp dispatch tasks.
+//	//	// TODO: If we want to retry, we must redo the plan fragment cutting and task scheduling.
+//	//	// That's a hard job but we can try it in the future.
+//	//	if sender.GetRPCError() != nil {
+//	//		logutil.BgLogger().Warn("mpp dispatch meet io error", zap.String("error", sender.GetRPCError().Error()), zap.Uint64("timestamp", taskMeta.StartTs), zap.Int64("task", taskMeta.TaskId))
+//	//		// if needTriggerFallback is true, we return timeout to trigger tikv's fallback
+//	//		if m.needTriggerFallback {
+//	//			err = derr.ErrTiFlashServerTimeout
+//	//		} else {
+//	//			err = sender.GetRPCError()
+//	//		}
+//	//	}
+//	//} else {
+//	rpcResps, err = m.store.GetTiKVClient().SendRequest(ctx, addr, wrappedReq, tikv.ReadTimeoutMedium)
+//	if errors.Cause(err) == context.Canceled || status.Code(errors.Cause(err)) == codes.Canceled {
+//		retry = false
+//	} else if err != nil {
+//		if bo.Backoff(tikv.BoTiFlashRPC(), err) == nil {
+//			retry = true
+//		}
+//	}
+//	//}
+//
+//	if retry {
+//		logutil.BgLogger().Warn("mpp dispatch meet error and retrying", zap.Error(err), zap.Uint64("timestamp", startTS))
+//		m.handleDispatchBatchReq(ctx, bo, reqs, addr, startTS)
+//		return
+//	}
+//
+//	if err != nil {
+//		logutil.BgLogger().Error("mpp dispatch meet error", zap.String("error", err.Error()), zap.Uint64("timestamp", startTS))
+//		// if needTriggerFallback is true, we return timeout to trigger tikv's fallback
+//		if m.needTriggerFallback {
+//			err = derr.ErrTiFlashServerTimeout
+//		}
+//		m.sendError(err)
+//		return
+//	}
+//
+//	realResps := rpcResps.Resp.(*mpp.DispatchTasksResponse)
+//
+//	for i, realResp := range realResps.Responses {
+//		//GO execute
+//		if realResp.Error != nil {
+//			logutil.BgLogger().Error("mpp dispatch response meet error", zap.String("error", realResp.Error.Msg), zap.Uint64("timestamp", startTS), zap.Int64("task", tasks[i].Meta.TaskId))
+//			m.sendError(errors.New(realResp.Error.Msg))
+//			return
+//		}
+//		if len(realResp.RetryRegions) > 0 {
+//			logutil.BgLogger().Info("TiFlash found " + strconv.Itoa(len(realResp.RetryRegions)) + " stale regions. Only first " + strconv.Itoa(mathutil.Min(10, len(realResp.RetryRegions))) + " regions will be logged if the log level is higher than Debug")
+//			for index, retry := range realResp.RetryRegions {
+//				id := tikv.NewRegionVerID(retry.Id, retry.RegionEpoch.ConfVer, retry.RegionEpoch.Version)
+//				if index < 10 || log.GetLevel() <= zap.DebugLevel {
+//					logutil.BgLogger().Info("invalid region because tiflash detected stale region", zap.String("region id", id.String()))
+//				}
+//				m.store.GetRegionCache().InvalidateCachedRegionWithReason(id, tikv.EpochNotMatch)
+//			}
+//		}
+//		failpoint.Inject("mppNonRootTaskError", func(val failpoint.Value) {
+//			if val.(bool) && !reqs[i].IsRoot {
+//				time.Sleep(1 * time.Second)
+//				m.sendError(derr.ErrTiFlashServerTimeout)
+//				return
+//			}
+//		})
+//		if !reqs[i].IsRoot {
+//			return
+//		}
+//
+//		m.establishMPPConns(bo, reqs[i], tasks[i].Meta)
+//	}
+//
+//}
 
 // NOTE: We do not retry here, because retry is helpless when errors result from TiFlash or Network. If errors occur, the execution on TiFlash will finally stop after some minutes.
 // This function is exclusively called, and only the first call succeeds sending tasks and setting all tasks as cancelled, while others will not work.
